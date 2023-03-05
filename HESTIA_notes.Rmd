@@ -1,0 +1,9 @@
+---
+title: "HESTIA_Notes"
+output: html_notebook
+---
+
+2do:
+
+remove taxonomic information as part of the raw data wrangle - make sure it is kept in a master document, but de-selecting columns should not be needed in the toxicological wrangling.
+ 

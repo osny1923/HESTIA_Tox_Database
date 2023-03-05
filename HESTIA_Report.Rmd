@@ -1,0 +1,127 @@
+---
+title: "HESTIA_Report"
+author: "Oskar Nyberg"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+# These libraries are used for analysis
+   #install.packages("webchem")
+   #install.packages("taxize")   # <- Installing the "taxize" library http://dx.doi.org/10.5281/zenodo.7097
+   #install.packages("networkD3") <- For the Sankey flow chart visualization
+   #install.packages("goeveg") # <- for simple coefficient of Variation calculation at summary of data
+    library(rmarkdown)
+    library(tidyverse)
+    library(webchem)
+    library(xlsx)
+    library(readr)
+    library(kableExtra)
+    library(taxize)
+    library(ggpubr)
+    library(networkD3)
+```
+
+# HESTIA Database construction.
+To generate EC20^EC10eq effect endpoints for chemicals i need data from  EC10, EC50 as well as LC and NOEC data.
+see `data/CIR_query_CAS_to_smiles.R` for details on the treatment of input CAS numbers, how all available SMILES configurations were gathered and thereafter exported as 4k row long subsets.
+This information on CAS and SMILES per substance was used as input into OECD QSAR Toolbox software where two distinct operations took place, 1) query for toxicological effect data, and 2) query for substance physicochemical data.
+When importing the CAS-SMILES input into QSAR toolbox, "multiplying" substances are present, since QSAR toolbox includes all SMILES configurations of any CAS number. hence, 16797 substances as input -> ~22k substances output.
+Acquired metadata data gives an abundance of test information across 550-660 columns, although the majority of these are redundant for the current purpose. Wrangling of the raw OECD QSAR Toolbox output takes place in `data/raw_data_read_and_wrangle.R` and is subsequently imported as a data frame for treatment and filtering. 
+
+```{r Physchem info, echo=FALSE}
+# Loading Physicochemial properties, code dependency -> "code/Physicochemical_properties.Rmd"
+NEW_PHYSCHEM <- read.csv("data/PHYSCHEM_INFO.csv")
+```
+
+In several steps of these filtering operations, physicochemical data is required, which is available for **`r nrow(NEW_PHYSCHEM)`** substances, code loaded from file "Physicochemical_properties.Rmd". This is imported at the here at the onset of data wrangling, because I need some of the physicochemical data and the pesticide annotations below (for pesticides, ACR annotations are 2.2, not standard 2, when converting EC50_acute -> EC50_chronic in USEtoc v2.1 according to USEtox manual!)
+
+## Raw data wrangling
+```{r reading TOX data}
+# Reading in the data input ready for wrangling. "Pre-filtered" implying that the data has been 
+# Dependency -> "data/raw_data_read_and_wrangle.R"
+HESTIA_HC20_DB_raw <- read.csv("data/HESTIA_HC20_DB_raw_toxdata.csv")
+names_db <- HESTIA_HC20_DB_raw %>% distinct(Database) %>% pull(Database)
+n_db1 <- nrow(HESTIA_HC20_DB_raw %>% filter(Database == "ECOTOX"))
+n_db2 <- nrow(HESTIA_HC20_DB_raw %>% filter(Database == "Aquatic OASIS"))
+n_db3 <- nrow(HESTIA_HC20_DB_raw %>% filter(Database == "Aquatic ECETOC"))
+n_db4 <- nrow(HESTIA_HC20_DB_raw %>% filter(Database == "Aquatic Japan MoE"))
+n_db5 <- nrow(HESTIA_HC20_DB_raw %>% filter(Database == "Food TOX Hazard EFSA"))
+```
+
+Importing, filtering and wrangling the ecotoxicological effect data from QSAR data output, including relevant metadata that can act as quality control. In this operation the OECD QSAR Toolbox output gets read in and a first step of harmonizing the data set. The files have different lengths and number of columns, which forces me to select a set of defined columns. Additionally, duplicates and completely empty records have been removed to have a neater data set to work with.
+Available from the `r count(HESTIA_HC20_DB_raw %>% distinct(Database))` databases; `r names_db[1]`, `r names_db[2]`, `r names_db[3]`,`r names_db[4]`, and `r names_db[5]` with `r n_db1`, `r n_db2`, `r n_db3`, `r n_db4`, and `r n_db5` records respectively.
+
+However, anomalies were discovered when visualizing the finished data that are easily fixed at the onset of wrangling. After inspecting source material, it is clear that most of these are incorrect entries into the ECOTOX database. Also, fixing the publication year of source material by merging two columns since different databases have different names for publication year. **Push to export a table of these?**
+```{r Adjusting misrepresented data}
+# Fixing a few data points that, after original source inspection, turns out to be incorrectly entered into the database and cause large spread of data. 
+HESTIA_HC20_DB <- HESTIA_HC20_DB_raw %>% 
+  mutate(
+    Value.MeanValue = gsub(pattern = ",", ".", Value.MeanValue), # replacing excel-format commas for dots.
+    Value.MeanValue = as.numeric(Value.MeanValue),
+    # Value entered as 10^+4.46... but should be exponented negatively: 10^-4.46...
+    Value.MeanValue = case_when(grepl("Structural Alerts", Title) & CAS.Number == "122-66-7" ~  2.238721E-05,
+                          TRUE ~ Value.MeanValue), 
+    # Entered as incorrect toxicity unit
+    Value.Unit = case_when(CAS.Number == "21145-77-7" & Author == "Artola-Garicano,E., T.L. Sinnige, I. Van Holsteijn, W.H.J. Vaes, and J.L.M. Hermens" ~ "µg/L",
+                          TRUE ~ Value.Unit), 
+    # Entered as incorrect toxicity unit
+    Value.Unit = case_when(grepl("The Acute and Chronic Toxicity of Ten Chlorinated Organic Compounds to the American Flagfish", Title) ~ "µg/L",
+                          TRUE ~ Value.Unit), 
+    # Entered as incorrect toxicity unit (mg/L instead of µM)
+    Value.Unit = case_when(grepl("The Influence of Solvents on the Acute Toxicity of some Lipophilic Chemicals to Aquatic Invertebrates", Title) ~ "µM",
+                          TRUE ~ Value.Unit), 
+    # Entered as incorrect toxicity unit (mg/L instead of µM/L)
+    Value.Unit = case_when(grepl("Comparative Acute Toxicity of the First 50 Multicentre Evaluation of In Vitro Cytotoxicity Chemicals to Aquatic Non-vertebrates", Title) ~ "µM/L",
+                          TRUE ~ Value.Unit), 
+    # Data entered as x M effect conc. But should be entered as 1/10^x M. 
+    Value.MeanValue = case_when(Author == "Wakabayashi,K., G. Sandmann, H. Ohta, and P. Boger" ~ 1/(10^Value.MeanValue),
+                          TRUE ~ Value.MeanValue), 
+    # Value incorrectly entered with 3 extra 0's
+    Value.MeanValue = case_when(grepl("Effects of Age and Coion (K+ and Na+) on the Toxicity", Title) & Value.MeanValue >10000 ~ Value.MeanValue/1000, 
+                          TRUE ~ Value.MeanValue),
+         CAS.Number = case_when(grepl("An aquatic toxicological evaluation of fenthion in the context of finch control in South Africa", Title) ~ "55-38-9",
+                                TRUE ~ CAS.Number),
+    # making all these data as character for coding flow purposes below.
+    Value.MeanValue = as.character(Value.MeanValue) 
+         ) %>% 
+# Merging columns of publication year
+    mutate(Year = case_when(is.na(Year) ~ Publication.year,
+                            TRUE ~ Year)) %>% 
+    select(-Publication.year)  # Removing redundant column
+```
+
+### Which endpoints to include.
+Saouter et al.(2022) defined 6 different conversion coefficients for chronic/acute EC50 -> chronic EC10 etc.
+Leo Posthuma used several more, all ECx (1-20), records with the endpoints NOEC, LOEC, maximum acceptable toxicant concentration, EC0, EC5, EC10, and EC20 are marked as “chronic NOEC”, records with (EC) or (LC) endpoint ranging from 30 to 70% are marked as “acute EC50”
+Acute/chronic definitions are available in Posthuma et al., 2019 (Table 1) and Aurisano et al., 2019 for algae, bacteria, unicellular animals, crustaceans, fish, molluscs/worms/etc.  
+
+Harmonization and aggregation of endpoints
+[$Aurisano et al., 2019, p. 2570$]  
+EC0, EL0, IC0, LC0, NOAEC, NOEC, NOEbC, NOErC, NOEL grouped into NOEC; EC10, IC10, LC10, LOEC grouped into EC10eq; EC50, EbC50, EbL50, ErC50, ErL50, IC50, LC50 grouped into EC50.
+“We combined LOEC and EC10 for deriving extrapolation factors based on high uncertainties in the low range of species sensitivity distributions, rendering it difficult to treat LOEC and EC10 as separate metrics in statistical analyses (Iwasaki et al. 2015; King et al. 2017).” [Aurisano et al., 2019, p. 2571]
+
+```{r Endpoint selection}
+# Dependency on the manually curated excel file where endpoints were selected and harmonized endpoint was given to each record respectively 
+kable(
+  read.csv("data/excel_references/Endpoints_selector.csv", sep = ";") %>% 
+    filter(!Group == "N",
+           !is.na(Group)) %>% 
+    arrange(Group),
+  caption = "Table of effect data endpoints included in the construction of the HESTIA toxicological database",
+  col.names = c("Endpoint", "n", "Harmonized Endpoint(*q*)")
+  )
+```
+
+
+## Values reported in range
+Effect concentration qualifiers 
+“A large majority of the results have a numeric value in the low range with a qualifier =, ca., >=, or >. In contrast, only a few tests have their results expressed in the higher ranges (5862 test results). The following selections were made to maximize the use of available data: 
+1. When there is a lower range value with the descriptors ‘>=, ca., or empty’, the lowest value is selected. If, within this group, a test has also a higher value, this higher value is ignored. 
+2. All lower range values described as ‘>’ are ignored (n = 39602), unless the higher value is described as ‘=<’ (n= 80 observations). In case of NOEC > than, the value was kept since it is still representing a concentration with no observed effect. 
+3. All higher values described as ‘< than’ are ignored, unless the lower range value is described as ‘>=’. Then the lower value is used. 
+4. When a lower range value is missing (0 or blank) and a higher value is available described as ‘<=’, the higher value is used. 
+5. When a lower value is described as >= and the higher value is described as <=, the lowest value is used. 
+6. Values expressed as ‘<’ are excluded (4397 test results).” [Saouter et al., 2018, p. 47]
+
